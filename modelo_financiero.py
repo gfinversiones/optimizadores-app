@@ -419,7 +419,12 @@ def run_model(
     vaff_vae  = van / van_egr if van_egr != 0 else float("nan")
     mirr_val  = _mirr(flujo, tasa_van)
     acum      = np.cumsum(flujo)
-    payback   = next((y for y, v in enumerate(acum) if v >= 0), None)
+
+    # Payback de obras: año en que el flujo acumulado cubre
+    # la inversión total en obras (puesta en valor + obras obligatorias).
+    # La repavimentación NO se incluye por definición del indicador.
+    inversion_obras = float(np.sum(PUESTA_VALOR) + np.sum(OBRAS_OBLIG * (1 + delta_capex_obras)))
+    payback   = next((y for y, v in enumerate(acum) if v >= inversion_obras), None)
 
     return dict(
         flujo         = flujo,
@@ -441,9 +446,10 @@ def run_model(
         van_ing       = van_ing,
         van_egr       = van_egr,
         vaff_vae      = vaff_vae,
-        mirr          = mirr_val,
-        payback       = payback,
-        uteq          = uteq,
+        mirr            = mirr_val,
+        payback         = payback,
+        inversion_obras = inversion_obras,
+        uteq            = uteq,
     )
 
 
@@ -633,7 +639,9 @@ st.divider()
 c1, c2, c3, c4 = st.columns(4)
 mirr_s   = f"{sc['mirr']:.2%}"   if not np.isnan(sc["mirr"]) else "n/d"
 vaff_s   = f"{sc['vaff_vae']:.4f}" if not np.isnan(sc["vaff_vae"]) else "n/d"
-pb_s     = f"Año {sc['payback']}" if sc["payback"] is not None else "No recupera"
+pb_año   = sc["payback"]
+pb_s     = f"Año {pb_año}  ({2025 + pb_año})" if pb_año is not None else "No recupera"
+inv_obras_s = fmt_ars(sc["inversion_obras"])
 
 c1.markdown(kpi("TIR Modificada (MIRR)", mirr_s,
                 sc["mirr"], MIRR_BASE), unsafe_allow_html=True)
@@ -641,7 +649,8 @@ c2.markdown(kpi(f"VAN  (tasa {tasa_van:.0%})", fmt_ars(sc["van"]),
                 sc["van"], VAN_BASE), unsafe_allow_html=True)
 c3.markdown(kpi("VAFF / VAE", vaff_s,
                 sc["vaff_vae"], VAFF_VAE_BASE), unsafe_allow_html=True)
-c4.markdown(kpi("Payback obras", pb_s, 0, 0), unsafe_allow_html=True)
+c4.markdown(kpi(f"Payback obras · {inv_obras_s}", pb_s, 0, 0),
+            unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
