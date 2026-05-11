@@ -1,2 +1,0 @@
-# optimizadores-app
-optimiza markowitz
