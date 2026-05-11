@@ -148,17 +148,61 @@ CAPEX_BASE = np.array([
 # ── OPEX con IVA – Conservación y Mantenimiento ────────────────
 OPEX_BASE = np.full(YEARS + 1, 3_853_810_000.00)
 
-# ── Amortización deuda (del sheet FLUJO – ya es un egreso fijo) ─
-AMORT_DEUDA_BASE = np.array([
-    0,                   # Y0
-    464_552_590.09,      # Y1 (cuota + gastos admin)
-    444_320_087.59,      # Y2-Y6
-    444_320_087.59,
-    444_320_087.59,
-    444_320_087.59,
-    444_320_087.59,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-], dtype=float)
+# ── Parámetros del préstamo ────────────────────────────────────
+# El préstamo = 70% de la Puesta en Valor.
+# Sistema francés, 6 años, TNA 8.5%, gastos admin 1% del capital.
+# Año de gracia: el ingreso entra en Y1, el primer pago en Y2.
+PUESTA_VALOR_MONTO = 2_890_357_500.0   # monto base puesta en valor
+PRESTAMO_PCT       = 0.70              # % sobre puesta en valor
+PRESTAMO_TNA       = 0.085
+PRESTAMO_AÑOS      = 6
+PRESTAMO_GASTOS    = 0.01              # gastos admin como % del capital
+
+
+def calcular_prestamo(monto_puesta_en_valor: float):
+    """
+    Devuelve (ingreso_credito, amort_deuda, intereses, capital).
+    Todos arrays [0..YEARS].
+    - Ingreso entra en Y1 (año de gracia: no paga en Y1).
+    - Cuotas francesas Y2..Y7 (6 pagos, sistema francés).
+    - La cuota del Y2 incluye los gastos administrativos (1% del capital).
+    - 'intereses' contiene solo el componente de interés de cada cuota
+      (sin los gastos administrativos), usado para la deducción del Art. 85 IIGG.
+    """
+    capital = monto_puesta_en_valor * PRESTAMO_PCT
+    gastos  = capital * PRESTAMO_GASTOS
+    tna     = PRESTAMO_TNA
+    n       = PRESTAMO_AÑOS
+
+    # Cuota francesa pura
+    cuota = capital * tna / (1 - (1 + tna) ** -n)
+
+    ingreso    = np.zeros(YEARS + 1)
+    amort      = np.zeros(YEARS + 1)
+    intereses  = np.zeros(YEARS + 1)   # interés puro por año (sin gastos admin)
+
+    ingreso[1] = capital   # el dinero entra en año 1; año de gracia: no paga
+
+    # Año 1: durante el año de gracia se devenga interés sobre el capital total
+    intereses[1] = capital * tna
+
+    saldo = capital
+    for k in range(n):            # k=0..5  ->  cuotas en Y2..Y7
+        y = k + 2
+        interes_k    = saldo * tna
+        amort_cap_k  = cuota - interes_k
+        saldo       -= amort_cap_k
+        if y <= YEARS:
+            amort[y]     = cuota + (gastos if k == 0 else 0.0)
+            intereses[y] = interes_k
+
+    return ingreso, amort, intereses, capital
+
+
+# Arrays base (se recalculan en run_model si cambia la sensibilidad)
+_ing_base, _amort_base, _int_base, _capital_base = calcular_prestamo(PUESTA_VALOR_MONTO)
+INGRESO_CREDITO  = _ing_base
+AMORT_DEUDA_BASE = _amort_base
 
 # ── Garantías anuales ──────────────────────────────────────────
 GARANTIAS = np.full(YEARS + 1, 28_000_000.0)
@@ -308,10 +352,6 @@ AL_SELLOS_BASE    = 0.012
 AL_DBCR_BASE      = 0.012
 AL_IVA_BASE       = 0.21     # IVA del peaje (21%)
 
-# Ingresos crédito LP (solo Y0)
-INGRESO_CREDITO = np.zeros(YEARS + 1)
-INGRESO_CREDITO[0] = 2_023_250_250.0
-
 # KPIs del xlsx (para mostrar delta vs base)
 MIRR_BASE    = 0.2330
 VAN_BASE     = 47_639_480_891.0
@@ -358,17 +398,12 @@ def run_model(
         factor_iva     = (1 + al_iva_peaje) / (1 + AL_IVA_BASE)
         peaje[y] = PEAJE_BASE[y] * factor_trafico * factor_iva
 
-    total_ingresos = peaje + INGRESO_CREDITO
+    # ── Préstamo recalculado según puesta en valor del escenario ──
+    ingreso_credito, amort_deuda, intereses_prestamo, capital_prestamo = calcular_prestamo(PUESTA_VALOR_MONTO)
+
+    total_ingresos = peaje + ingreso_credito
 
     # ── CAPEX escalado ──────────────────────────────────────────
-    # Distinguimos puesta en valor (Y0), obras oblig. (Y6-Y16)
-    # y repavimentación (Y3-Y5, Y6-Y9, Y13-Y20).
-    # Como simplificación pragmática aplicamos:
-    #   - delta_capex_obras  → todos los años con obras obligatorias
-    #   - delta_capex_repav  → todos los años con repavimentación
-    # Para la puesta en valor (Y0) no aplicamos sensibilidad (ya ejecutada).
-
-    # Arrays de obras oblig y repav del xlsx
     OBRAS_OBLIG = np.array([
         0,0,0,0,0,0,
         5_702_850_000, 11_405_700_000, 11_405_700_000, 11_405_700_000,
@@ -383,9 +418,9 @@ def run_model(
         4_335_536_250, 4_335_536_250, 4_335_536_250,
         4_335_536_250, 8_671_072_500, 8_671_072_500, 8_671_072_500, 8_671_072_500,
     ], dtype=float)
-    PUESTA_VALOR = np.array([2_890_357_500.0] + [0]*20, dtype=float)
+    PUESTA_VALOR_ARR = np.array([PUESTA_VALOR_MONTO] + [0]*20, dtype=float)
 
-    capex = (PUESTA_VALOR
+    capex = (PUESTA_VALOR_ARR
              + OBRAS_OBLIG * (1 + delta_capex_obras)
              + REPAV       * (1 + delta_capex_repav))
 
@@ -393,21 +428,69 @@ def run_model(
     opex = OPEX_BASE * (1 + delta_opex)
 
     # ── Impuestos escalados ─────────────────────────────────────
-    # Cada impuesto se escala por el cociente alícuota_nueva / alícuota_base.
-    # Para IVA y Ganancias también entra el factor de tráfico (base imponible sube).
     factor_trafico_avg = np.where(UTEQ_BASE > 0, uteq / UTEQ_BASE, 1.0)
-    # Para IVA el ingreso base cambia tanto por tráfico como por alícuota
-    imp_iva      = IMP_IVA_BASE * factor_trafico_avg * ((1 + al_iva_peaje) / (1 + AL_IVA_BASE))
-    imp_ganancias = IMP_GANANCIAS_BASE * factor_trafico_avg * (al_ganancias / AL_GANANCIAS_BASE)
-    imp_ib        = IMP_IB_BASE        * factor_trafico_avg * (al_ib        / AL_IB_BASE)
+
+    imp_iva       = IMP_IVA_BASE      * factor_trafico_avg * ((1 + al_iva_peaje) / (1 + AL_IVA_BASE))
+    imp_ib        = IMP_IB_BASE       * factor_trafico_avg * (al_ib        / AL_IB_BASE)
     imp_municipal = IMP_MUNICIPAL_BASE * factor_trafico_avg * (al_municipal / AL_MUNICIPAL_BASE)
-    imp_sellos    = IMP_SELLOS_BASE    * (al_sellos / AL_SELLOS_BASE)
-    imp_dbcr      = IMP_DBCR_BASE      * factor_trafico_avg * (al_dbcr     / AL_DBCR_BASE)
+    imp_sellos    = IMP_SELLOS_BASE   * (al_sellos / AL_SELLOS_BASE)
+    imp_dbcr      = IMP_DBCR_BASE     * factor_trafico_avg * (al_dbcr     / AL_DBCR_BASE)
+
+    # ── Impuesto a las Ganancias con deducción de intereses (Art. 85 LIG) ──
+    # Base imponible antes de intereses y amortizaciones fiscales:
+    #   ingreso_sin_iva  - opex_sin_iva  - otros_impuestos_deducibles
+    # La deducción de intereses se limita al MAYOR entre:
+    #   a) 30% de la ganancia neta antes de intereses y amortizaciones
+    #   b) el interés real del período
+    # (en la práctica el art. 85 fija el límite en 30%; se deduce lo menor
+    #  entre el interés real y ese límite, salvo que el real sea menor)
+    #
+    # Simplificación aplicada:
+    #   - ingreso_gravado   = peaje sin IVA
+    #   - opex_deducible    = opex sin IVA (mantenimiento)
+    #   - amort_fiscal      = capex / vida útil restante (lineal, se escala con CAPEX)
+    #   - deducción interés = min(interés_real, 30% * EBITDA_impositivo)
+
+    # Ingreso gravado sin IVA (escalar base por tráfico)
+    ing_sin_iva   = peaje / (1 + al_iva_peaje)          # peaje ya escalado por tráfico
+    opex_sin_iva  = opex  / (1 + 0.15)                  # IVA OPEX mantenimiento = 15%
+
+    # Amortización fiscal acumulada del CAPEX (lineal por tramo)
+    VIDA_UTIL = YEARS
+    amort_fiscal = np.zeros(YEARS + 1)
+    for y0 in range(YEARS + 1):
+        if capex[y0] > 0:
+            capex_sin_iva_y0 = capex[y0] / (1 + AL_IVA_BASE)
+            vida_rem = max(VIDA_UTIL - y0, 1)
+            cuota_am = capex_sin_iva_y0 / vida_rem
+            for yf in range(y0, YEARS + 1):
+                amort_fiscal[yf] += cuota_am
+
+    imp_ganancias = np.zeros(YEARS + 1)
+    for y in range(YEARS + 1):
+        # EBITDA impositivo (antes de intereses y amortizaciones fiscales)
+        ebitda_imp = max(0.0, ing_sin_iva[y] - opex_sin_iva[y])
+
+        # Límite de deducción: 30% del EBITDA impositivo
+        limite_30  = 0.30 * ebitda_imp
+
+        # Interés real del período (del cuadro del préstamo)
+        interes_real = intereses_prestamo[y]
+
+        # Deducción efectiva: no puede superar el 30% del EBITDA
+        # (si el interés real es menor al límite, se deduce el real)
+        deduccion_intereses = min(interes_real, limite_30)
+
+        # Base imponible neta
+        base_iigg = max(0.0,
+            ebitda_imp - amort_fiscal[y] - deduccion_intereses
+        )
+        imp_ganancias[y] = base_iigg * al_ganancias
 
     total_impuestos = imp_iva + imp_ganancias + imp_ib + imp_municipal + imp_sellos + imp_dbcr
 
     # ── Egresos totales ─────────────────────────────────────────
-    total_egresos = capex + opex + AMORT_DEUDA_BASE + total_impuestos + GARANTIAS
+    total_egresos = capex + opex + amort_deuda + total_impuestos + GARANTIAS
 
     # ── Flujo neto ──────────────────────────────────────────────
     flujo = total_ingresos - total_egresos
@@ -423,7 +506,7 @@ def run_model(
     # Payback de obras: año en que el flujo acumulado cubre
     # la inversión total en obras (puesta en valor + obras obligatorias).
     # La repavimentación NO se incluye por definición del indicador.
-    inversion_obras = float(np.sum(PUESTA_VALOR) + np.sum(OBRAS_OBLIG * (1 + delta_capex_obras)))
+    inversion_obras = float(np.sum(PUESTA_VALOR_ARR) + np.sum(OBRAS_OBLIG * (1 + delta_capex_obras)))
     payback   = next((y for y, v in enumerate(acum) if v >= inversion_obras), None)
 
     return dict(
@@ -433,9 +516,11 @@ def run_model(
         peaje         = peaje,
         capex         = capex,
         opex          = opex,
-        amort_deuda   = AMORT_DEUDA_BASE.copy(),
+        amort_deuda      = amort_deuda,
+        capital_prestamo = capital_prestamo,
         imp_iva       = imp_iva,
-        imp_ganancias = imp_ganancias,
+        imp_ganancias       = imp_ganancias,
+        intereses_prestamo = intereses_prestamo,
         imp_ib        = imp_ib,
         imp_municipal = imp_municipal,
         imp_sellos    = imp_sellos,
