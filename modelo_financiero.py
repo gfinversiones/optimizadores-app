@@ -119,8 +119,10 @@ TARIFA_IVA  = TARIFA_BASE * 1.21
 #       del ingreso que el xlsx asigna a Y1, pero NO se cobra ese año.
 # Y2 en adelante: tránsito crece sobre el tránsito de arranque.
 UTEQ_BASE = np.zeros(YEARS + 1)
-# Tránsito de "arranque" (año 1): derivado del xlsx aunque no genera ingreso
-UTEQ_ARRANQUE = PEAJE_BASE[1] / TARIFA_IVA   # ≈ 3.382 M UTEQs
+# Tránsito de "arranque" (año 1): PEAJE_BASE está en valores SIN IVA (= FLUJO!D73).
+# En el xlsx: UTEQ_arranque = CONTROL!C19 × 1.05 = 3,781,945 × 1.05 = 3,971,042
+# Equivalentemente: PEAJE_BASE[1] / TARIFA_BASE  (sin IVA / tarifa sin IVA)
+UTEQ_ARRANQUE = PEAJE_BASE[1] / TARIFA_BASE   # ≈ 3.971 M UTEQs
 
 # Crecimiento base a partir de Y3: 3% anual (configurable vía delta_trafico)
 TRAFICO_CRECIMIENTO_BASE = 0.03
@@ -385,38 +387,31 @@ def run_model(
     tasa_van            = TASA_VAN_BASE,
 ):
     # ── Tráfico ─────────────────────────────────────────────────
-    # Y0: 0 (puesta en valor)
-    # Y1: tránsito de arranque (referencia), pero SIN ingresos de peaje
-    # Y2: arranque × 1.05 (crecimiento fijo del 5% el primer año de cobro)
-    # Y3+: crece a tasa_base + delta_trafico cada año
+    # En el xlsx:
+    #   Y1: UTEQs = UTEQ_ARRANQUE (= CONTROL!C19 × 1.05), genera ingresos
+    #   Y2: UTEQs = Y1 × (1 + tasa_crecimiento), etc.
+    # El CAPEX de puesta en valor ocurre en Y0 (año previo a la concesión).
     uteq = np.zeros(YEARS + 1)
     uteq[0] = 0.0
-    uteq[1] = UTEQ_ARRANQUE                        # referencia; NO genera ingreso
-    uteq[2] = UTEQ_ARRANQUE * 1.05                 # +5% fijo Y1→Y2
     tasa_eff = TRAFICO_CRECIMIENTO_BASE + delta_trafico
     tasa_eff = max(tasa_eff, -0.50)
-    for y in range(3, YEARS + 1):
+    uteq[1] = UTEQ_ARRANQUE                              # año 1: arranque, genera ingresos
+    for y in range(2, YEARS + 1):
         uteq[y] = uteq[y - 1] * (1 + tasa_eff)
 
-    # ── Ingresos de peaje ───────────────────────────────────────
-    # Ingreso = UTEQ × tarifa × (1 + IVA)
-    # Y0 y Y1: 0 (sin cobro de peaje)
-    # Y2+: calculado explícitamente con tarifa y tránsito modelados
-    tarifa_con_iva = tarifa * (1 + al_iva_peaje)
+    # ── Ingresos de peaje (SIN IVA, igual al xlsx fila 18/22) ──────
+    # El xlsx trabaja con ingresos sin IVA; el IVA se gestiona en la fila 85 (IVA saldo a pagar)
+    # Por consistencia, el peaje se calcula sin IVA = uteq × tarifa
     peaje = np.zeros(YEARS + 1)
-    # Y0: 0
-    # Y1: 0  (primer año sin ingresos de peaje, per modelo)
-    for y in range(2, YEARS + 1):
-        peaje[y] = uteq[y] * tarifa_con_iva
+    for y in range(1, YEARS + 1):
+        peaje[y] = uteq[y] * tarifa
 
-    # Factor de tráfico vs base (para escalar impuestos proporcionales)
-    # Usamos uteq[2] / UTEQ_ARRANQUE como referencia de "año normalizado 1"
-    # Para Y1 el factor es 0 (no hay ingresos), para Y0 también 0.
+    # Factor de tráfico vs base para escalar impuestos proporcionales
+    # Referencia = Y1 (UTEQ_ARRANQUE), que es el año de inicio de cobro
     uteq_ref_for_tax = np.zeros(YEARS + 1)
     uteq_ref_for_tax[0] = 0.0
-    uteq_ref_for_tax[1] = 0.0   # Y1 sin cobro → impuestos sobre peaje = 0
-    for y in range(2, YEARS + 1):
-        uteq_ref_for_tax[y] = uteq[y] / (UTEQ_ARRANQUE * 1.05) if UTEQ_ARRANQUE > 0 else 1.0
+    for y in range(1, YEARS + 1):
+        uteq_ref_for_tax[y] = uteq[y] / UTEQ_ARRANQUE if UTEQ_ARRANQUE > 0 else 1.0
 
     total_ingresos = peaje + INGRESO_CREDITO
 
@@ -479,17 +474,18 @@ def run_model(
     #
     # Mejora clave: ARRASTRE DE QUEBRANTOS (fila 64 del xlsx).
 
-    gan_base_shifted = np.concatenate([[0.0], IMP_GANANCIAS_BASE[:-1]])   # [y] = xlsx año y
-
-    bi_base_s = np.where(AL_GANANCIAS_BASE > 0,
-                         gan_base_shifted / AL_GANANCIAS_BASE, 0.0)
+    # Ganancias: IMP_GANANCIAS_BASE[y] = impuesto xlsx año y (sin shift, alineado correctamente)
+    bi_base = np.where(AL_GANANCIAS_BASE > 0,
+                       IMP_GANANCIAS_BASE / AL_GANANCIAS_BASE, 0.0)
     gastos_base = OPEX_BASE / (1 + AL_IVA_GASTOS_BASE) + GARANTIAS
-    bi_var_base = bi_base_s + gastos_base   # parte positiva de la BI (sin OPEX)
+    bi_var_base = bi_base + gastos_base   # parte positiva de la BI (sin OPEX)
 
     # Factor incremental de tráfico/tarifa respecto al base del xlsx
-    factor_traf_base = np.ones(YEARS + 1)
-    factor_traf_base[0] = 0.0; factor_traf_base[1] = 0.0; factor_traf_base[2] = 1.0
-    for y in range(3, YEARS + 1):
+    # Y1 = arranque (factor=1.0), Y2 = Y1×1.03, etc.
+    factor_traf_base = np.zeros(YEARS + 1)
+    factor_traf_base[0] = 0.0
+    factor_traf_base[1] = 1.0   # año base de cobro
+    for y in range(2, YEARS + 1):
         factor_traf_base[y] = factor_traf_base[y - 1] * (1 + TRAFICO_CRECIMIENTO_BASE)
 
     fi_rel = np.where(factor_traf_base > 0, factor_trafico_avg / factor_traf_base, 1.0)
@@ -617,21 +613,20 @@ with st.sidebar:
         "Tarifa base (ARS/UTEQ, sin IVA)",
         min_value=1_000, max_value=50_000,
         value=int(TARIFA_BASE), step=500,
-        help=f"Tarifa base del xlsx: $ {TARIFA_BASE:,.0f}. Se aplica desde el Año 2."
+        help=f"Tarifa base del xlsx: $ {TARIFA_BASE:,.0f}. Se aplica desde el Año 1."
     )
 
     st.caption(
         "📌 **Regla de ingresos:**  \n"
-        "**Año 1** → sin cobro de peaje (= 0).  \n"
-        "**Año 2** → tránsito arranque × **+5%** fijo.  \n"
-        "**Año 3+** → crece a tasa base 3% + Δ abajo."
+        "**Año 1** → tránsito arranque (UTEQs base × 1.05), genera ingresos.  \n"
+        "**Año 2+** → crece a tasa base 3% + Δ abajo."
     )
 
     delta_trafico_pp = st.slider(
         "Δ tasa crecimiento anual Año 3+ (±pp sobre base 3%)",
         min_value=-3.0, max_value=5.0, value=0.0, step=0.5,
         format="%.1f pp",
-        help="Solo afecta al Año 3 en adelante. El +5% de Y1→Y2 es siempre fijo."
+        help="Afecta al Año 2 en adelante (tasa base 3%)"
     )
     delta_trafico = delta_trafico_pp / 100
 
@@ -942,7 +937,7 @@ with tab2:
 with tab3:
     # ── Info box sobre la lógica de tránsito ──────────────────
     tasa_eff_display = (TRAFICO_CRECIMIENTO_BASE + delta_trafico) * 100
-    uteq_y2 = sc['uteq'][2]
+    uteq_y2 = sc["uteq"][2]
     uteq_y3 = sc['uteq'][3]
     st.info(
         f"**Lógica de ingresos de peaje:**  \n"
