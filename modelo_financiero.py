@@ -271,6 +271,48 @@ IMP_MUNICIPAL_BASE = np.array([
 ], dtype=float)
 IMP_MUNICIPAL_BASE[20] = IMP_MUNICIPAL_BASE[19]
 
+# ── Amortización impositiva (del sheet IMPUESTOS fila 48) ─────
+AMORT_IMP_BASE = np.array([
+    0,                    # Y0
+    119_436_260,          # Y1
+    119_436_260,          # Y2
+    119_436_260,          # Y3
+    836_053_822,          # Y4
+    1_552_671_384,        # Y5
+    2_269_288_946,        # Y6
+    4_039_174_011,        # Y7
+    5_472_409_135,        # Y8
+    6_189_026_697,        # Y9
+    5_759_056_160,        # Y10
+    5_042_438_598,        # Y11
+    3_609_203_474,        # Y12
+    2_175_968_350,        # Y13
+    1_459_350_788,        # Y14
+    1_889_321_325,        # Y15
+    2_605_938_887,        # Y16
+    3_501_710_840,        # Y17
+    5_890_436_046,        # Y18
+    8_756_906_294,        # Y19
+    15_206_464_352,       # Y20
+], dtype=float)
+
+# ── Intereses deducibles efectivos del préstamo (IMPUESTOS fila 60) ──
+# Solo aplican años 1-7 (mientras dura el préstamo)
+INT_DEDUCIBLES_BASE = np.array([
+    0,                    # Y0
+    0,                    # Y1
+    171_976_271,          # Y2
+    148_827_047,          # Y3
+    123_710_138,          # Y4
+    96_458_293,           # Y5
+    66_890_040,           # Y6
+    34_808_486,           # Y7
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+], dtype=float)
+
+# Parámetros de la base imponible
+AL_IVA_GASTOS_BASE = 0.11   # IVA sobre gastos operativos (OPEX)
+
 IMP_SELLOS_BASE = np.array([
     398_790_269.26,   # Y0
     398_790_269.26,   # Y1
@@ -419,11 +461,53 @@ def run_model(
     factor_trafico_avg = uteq_ref_for_tax * factor_tarifa
     # Para IVA el ingreso base cambia tanto por tráfico como por alícuota
     imp_iva      = IMP_IVA_BASE * factor_trafico_avg * ((1 + al_iva_peaje) / (1 + AL_IVA_BASE))
-    imp_ganancias = IMP_GANANCIAS_BASE * factor_trafico_avg * (al_ganancias / AL_GANANCIAS_BASE)
     imp_ib        = IMP_IB_BASE        * factor_trafico_avg * (al_ib        / AL_IB_BASE)
     imp_municipal = IMP_MUNICIPAL_BASE * factor_trafico_avg * (al_municipal / AL_MUNICIPAL_BASE)
     imp_sellos    = IMP_SELLOS_BASE    * (al_sellos / AL_SELLOS_BASE)
     imp_dbcr      = IMP_DBCR_BASE      * factor_trafico_avg * (al_dbcr     / AL_DBCR_BASE)
+
+    # ── Impuesto a las Ganancias (replicando lógica del xlsx) ────
+    #
+    # Nota de indexación: IMP_GANANCIAS_BASE[y] (Python) = ganancias xlsx año (y+1).
+    # Para Python año y, el valor del xlsx es IMP_GANANCIAS_BASE[y-1].
+    # Construimos un array shifted: gan_base_shifted[y] = IMP_GANANCIAS_BASE[y-1].
+    #
+    # Para sensibilidades usamos el mismo fi_rel que para los otros impuestos:
+    #   fi_rel[y] = (factor_trafico_avg[y] / factor_traf_base[y])
+    # donde factor_traf_base[y] = (1+3%)^(y-2) para y>=2 (crecimiento base del xlsx).
+    # En el caso base fi_rel = 1.0 → replica exactamente el xlsx.
+    #
+    # Mejora clave: ARRASTRE DE QUEBRANTOS (fila 64 del xlsx).
+
+    gan_base_shifted = np.concatenate([[0.0], IMP_GANANCIAS_BASE[:-1]])   # [y] = xlsx año y
+
+    bi_base_s = np.where(AL_GANANCIAS_BASE > 0,
+                         gan_base_shifted / AL_GANANCIAS_BASE, 0.0)
+    gastos_base = OPEX_BASE / (1 + AL_IVA_GASTOS_BASE) + GARANTIAS
+    bi_var_base = bi_base_s + gastos_base   # parte positiva de la BI (sin OPEX)
+
+    # Factor incremental de tráfico/tarifa respecto al base del xlsx
+    factor_traf_base = np.ones(YEARS + 1)
+    factor_traf_base[0] = 0.0; factor_traf_base[1] = 0.0; factor_traf_base[2] = 1.0
+    for y in range(3, YEARS + 1):
+        factor_traf_base[y] = factor_traf_base[y - 1] * (1 + TRAFICO_CRECIMIENTO_BASE)
+
+    fi_rel = np.where(factor_traf_base > 0, factor_trafico_avg / factor_traf_base, 1.0)
+
+    gastos_sen     = opex / (1 + AL_IVA_GASTOS_BASE) + GARANTIAS
+    base_imponible = bi_var_base * fi_rel - gastos_sen
+
+    # Quebrantos acumulados + impuesto (filas 64-66 del xlsx)
+    quebranto_acum = np.zeros(YEARS + 1)
+    imp_ganancias  = np.zeros(YEARS + 1)
+    for y in range(1, YEARS + 1):
+        base_y = base_imponible[y] + quebranto_acum[y - 1]
+        if base_y <= 0:
+            quebranto_acum[y] = base_y   # acumula quebranto (negativo)
+            imp_ganancias[y]  = 0.0
+        else:
+            quebranto_acum[y] = 0.0
+            imp_ganancias[y]  = base_y * al_ganancias
 
     total_impuestos = imp_iva + imp_ganancias + imp_ib + imp_municipal + imp_sellos + imp_dbcr
 
@@ -868,6 +952,7 @@ with tab3:
         f"  Año 3: {uteq_y3:,.0f} UTEQs → $ {sc['peaje'][3]/1e9:.2f} MM."
     )
     tarifa_con_iva_display = float(tarifa_input) * (1 + al_iva_peaje)
+    rows = []
     for y in range(YEARS + 1):
         rows.append({
             "Año cal.":           YEARS_RANGE[y],
